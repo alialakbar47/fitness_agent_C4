@@ -43,7 +43,6 @@ class PersonaManager:
         """Get a brief description of a persona."""
         descriptions = {
             "drill_sergeant": "Strict, no-nonsense coach who pushes you to your limits with military-style discipline.",
-            "helpful_assistant": "Friendly and supportive guide who patiently helps you achieve your goals.",
-            "motivational_coach": "High-energy cheerleader who pumps you up and celebrates every victory!"
+            "helpful_assistant": "Friendly and supportive guide who patiently helps you achieve your goals."
         }
         return descriptions.get(persona, "Unknown persona")

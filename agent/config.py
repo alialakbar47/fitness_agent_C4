@@ -118,8 +118,7 @@ class LLMConfig:
     def get_available_models() -> Dict[str, str]:
         """Get available Gemini models."""
         return {
-            "gemini-2.0-flash-exp": "Gemini 2.0 Flash",
-            "gemini-2.5-flash-exp": "Gemini 2.5 Flash",
-            "gemini-2.0-pro-exp": "Gemini 2.0 Pro",
-            "gemini-2.0-flash-lite-exp": "Gemini 2.0 Flash Lite"
+            "gemini-2.0-flash-exp": "Gemini 2.0 Flash (Experimental)",
+            "gemini-2.5-flash-lite": "Gemini 2.5 Flash Lite (Dec 2024)",
+            "gemini-2.0-flash-lite": "Gemini 2.0 Flash Lite",
         }

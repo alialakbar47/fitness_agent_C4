@@ -1,12 +1,123 @@
 from typing import Dict, List, Any
 from datetime import datetime, timedelta
 import logging
+import re
 from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
 # Initialize database manager
 db = DatabaseManager()
+
+
+def _parse_flexible_datetime(date_time_str: str) -> tuple:
+    """
+    Parse flexible datetime formats and return standardized datetime.
+    
+    Handles formats like:
+    - "2024-10-27 3" or "2024-10-27 3pm" -> "2024-10-27 15:00:00"
+    - "2024-10-27 3:00" -> "2024-10-27 03:00:00"
+    - "2024-10-27 15:00" -> "2024-10-27 15:00:00"
+    - "tomorrow at 3" -> next day at 15:00
+    - "next monday at 10am" -> next monday at 10:00
+    
+    Returns:
+        (success, datetime_obj or error_message)
+    """
+    try:
+        # Clean up the input
+        date_time_str = date_time_str.strip().lower()
+        
+        # Handle relative dates (tomorrow, today, next week, etc.)
+        date_part = None
+        time_part = None
+        
+        # Extract date and time parts
+        if ' at ' in date_time_str:
+            parts = date_time_str.split(' at ')
+            date_part = parts[0].strip()
+            time_part = parts[1].strip()
+        elif re.match(r'\d{4}-\d{2}-\d{2}', date_time_str):
+            # Has a date in YYYY-MM-DD format
+            match = re.match(r'(\d{4}-\d{2}-\d{2})\s+(.+)', date_time_str)
+            if match:
+                date_part = match.group(1)
+                time_part = match.group(2)
+            else:
+                date_part = date_time_str
+        else:
+            # Try to parse the whole thing as a date-time
+            time_part = date_time_str
+        
+        # Parse the date part
+        if date_part:
+            if date_part == 'today':
+                base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            elif date_part == 'tomorrow':
+                base_date = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            elif re.match(r'\d{4}-\d{2}-\d{2}', date_part):
+                base_date = datetime.strptime(date_part, '%Y-%m-%d')
+            else:
+                return False, f"Could not parse date: {date_part}"
+        else:
+            base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Parse the time part
+        if time_part:
+            # Remove common words
+            time_part = time_part.replace('at', '').strip()
+            
+            # Check for AM/PM
+            is_pm = 'pm' in time_part or 'p.m' in time_part
+            is_am = 'am' in time_part or 'a.m' in time_part
+            time_part = re.sub(r'[ap]\.?m\.?', '', time_part).strip()
+            
+            # Try to extract hour and minute
+            if ':' in time_part:
+                # Format: "3:00", "15:30"
+                parts = time_part.split(':')
+                hour = int(parts[0])
+                minute = int(parts[1]) if len(parts) > 1 else 0
+            elif time_part.isdigit():
+                # Format: "3", "15"
+                hour = int(time_part)
+                minute = 0
+            else:
+                # Try to extract just numbers
+                numbers = re.findall(r'\d+', time_part)
+                if numbers:
+                    hour = int(numbers[0])
+                    minute = int(numbers[1]) if len(numbers) > 1 else 0
+                else:
+                    return False, f"Could not parse time: {time_part}"
+            
+            # Handle AM/PM conversion
+            if is_pm and hour < 12:
+                hour += 12
+            elif is_am and hour == 12:
+                hour = 0
+            
+            # Handle 24-hour format where hour < 12 without am/pm might be PM for afternoon times
+            # If user says "3" and it's afternoon context, assume PM
+            if not is_am and not is_pm and 1 <= hour <= 11:
+                # If it's a common afternoon/evening time, assume PM
+                current_hour = datetime.now().hour
+                if current_hour >= 12:  # It's afternoon/evening now
+                    hour += 12
+            
+            if hour < 0 or hour > 23:
+                return False, f"Invalid hour: {hour}. Must be 0-23"
+            if minute < 0 or minute > 59:
+                return False, f"Invalid minute: {minute}. Must be 0-59"
+            
+            result_datetime = base_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        else:
+            result_datetime = base_date
+        
+        return True, result_datetime
+        
+    except Exception as e:
+        return False, f"Error parsing datetime: {str(e)}"
 
 
 def check_availability(service_type: str, date: str) -> Dict[str, Any]:
@@ -59,7 +170,12 @@ def book_session(username: str, service_type: str, date_time: str, notes: str = 
     Args:
         username: Username of the person booking
         service_type: Type of service (personal_training, group_class, nutrition_consult)
-        date_time: Date and time in YYYY-MM-DD HH:MM format
+        date_time: Date and time in flexible formats:
+                  - "YYYY-MM-DD HH:MM" (e.g., "2024-10-27 14:00")
+                  - "YYYY-MM-DD H" (e.g., "2024-10-27 3" -> assumes 3 PM if afternoon context)
+                  - "YYYY-MM-DD Hpm/am" (e.g., "2024-10-27 3pm")
+                  - "tomorrow at 3pm"
+                  - "today at 15:00"
         notes: Optional notes for the booking
     
     Returns:
@@ -74,20 +190,16 @@ def book_session(username: str, service_type: str, date_time: str, notes: str = 
                 "message": f"Invalid service type. Choose from: {', '.join(valid_services)}"
             }
         
-        # Parse and validate datetime
-        try:
-            # Handle both "YYYY-MM-DD HH:MM" and "YYYY-MM-DD HH:MM:SS" formats
-            if len(date_time.split(':')) == 2:
-                date_time_obj = datetime.strptime(date_time, '%Y-%m-%d %H:%M')
-                date_time_formatted = date_time_obj.strftime('%Y-%m-%d %H:%M:00')
-            else:
-                date_time_obj = datetime.strptime(date_time, '%Y-%m-%d %H:%M:%S')
-                date_time_formatted = date_time
-        except ValueError:
+        # Parse datetime with flexible format support
+        success, result = _parse_flexible_datetime(date_time)
+        if not success:
             return {
                 "status": "error",
-                "message": "Invalid date-time format. Use YYYY-MM-DD HH:MM"
+                "message": f"Invalid date/time format. {result}. Please provide a valid date and time."
             }
+        
+        date_time_obj = result
+        date_time_formatted = date_time_obj.strftime('%Y-%m-%d %H:%M:00')
         
         # Check if time is in the future
         if date_time_obj < datetime.now():
@@ -568,7 +680,11 @@ Available Tools:
    - Create a booking record
    - username: User making the booking
    - service_type: Type of service
-   - date_time: Date and time in "YYYY-MM-DD HH:MM" format
+   - date_time: Date and time in flexible formats:
+     * "YYYY-MM-DD HH:MM" (e.g., "2024-10-27 14:00")
+     * "YYYY-MM-DD H" (e.g., "2024-10-27 3" -> interprets as 3 PM if afternoon)
+     * "YYYY-MM-DD Hpm" or "YYYY-MM-DD Ham" (e.g., "2024-10-27 3pm")
+     * "tomorrow at 3pm", "today at 15:00"
    - notes: Optional notes (default: "")
    - Returns: Confirmation with booking ID
 

@@ -3,6 +3,7 @@
 from typing import TypedDict, Annotated, List, Dict, Any
 from langgraph.graph import StateGraph, END
 import re
+import json
 import logging
 from agent.config import LLMConfig
 from agent.personas import PersonaManager
@@ -73,6 +74,11 @@ class FitFusionAgent:
                 state["final_answer"] = "I apologize, but I'm having trouble processing this request. Could you rephrase it?"
                 return state
             
+            # Get current date for context
+            from datetime import datetime as dt
+            current_date = dt.now().strftime('%Y-%m-%d')
+            current_year = dt.now().year
+            
             # Build prompt with conversation history
             system_prompt = self.persona_manager.get_system_prompt()
             
@@ -84,9 +90,17 @@ class FitFusionAgent:
                 history += f"{role}: {content}\n"
             
             # Add previous thought/observation if exists
-            if state.get("observation"):
-                history += f"\nPrevious Tool Result (Observation): {state['observation']}\n"
-                history += "Important: Review the observation above carefully before deciding your next action.\n"
+            has_observation = bool(state.get("observation"))
+            observation_text = state.get("observation", "")
+            
+            if has_observation:
+                history += f"\n{'='*60}\n"
+                history += f"🔍 TOOL RESULT (YOU MUST READ THIS):\n"
+                history += f"{observation_text}\n"
+                history += f"{'='*60}\n"
+                history += "⚠️ CRITICAL: The tool result above contains the data you need!\n"
+                history += "You MUST use this information in your next Answer.\n"
+                history += "Do NOT say 'no results found' if the tool returned data.\n\n"
             
             # Generate reasoning
             user_message = state["messages"][-1]["content"] if state["messages"] else ""
@@ -95,17 +109,30 @@ class FitFusionAgent:
 
 Now continue with your ReAct reasoning. 
 
+🗓️ CURRENT DATE: {current_date} (Year: {current_year})
+⚠️ Always use {current_year} for dates, NOT 2024!
+
 CRITICAL INSTRUCTIONS:
-1. If you just received an Observation with tool results, READ IT CAREFULLY
-2. The Observation contains the actual data - use it in your Answer
-3. Start with "Thought:" to show reasoning
-4. Use "Action:" ONLY if you need to call another tool
-5. Use "Answer:" when you have enough information to respond to the user
+1. If you just received a Tool Result above, YOU MUST READ AND USE IT
+2. The Tool Result shows SUCCESS or data - extract and present it to the user
+3. If Tool Result shows ERROR, tell the user about the error - don't pretend it succeeded
+4. For view_bookings: If "bookings" key has items, those ARE the bookings - list them!
+5. Start with "Thought:" to show your reasoning about what you learned
+6. Use "Action:" ONLY if you need to call ANOTHER tool for MORE information
+7. Use "Answer:" when you have the information to respond to the user
 
 Current user: {state['current_user']}
 User's question: {user_message}
 
-Remember: If the Observation shows results, include them in your Answer. Don't ignore tool results!
+Example when you have booking data:
+Thought: The tool returned bookings data with X bookings. I should present these to the user.
+Answer: Here are your bookings: [list them with details from the observation]
+
+Example when tool returns ERROR:
+Thought: The tool returned an error: "Cannot book sessions in the past". I must tell the user and suggest alternatives.
+Answer: I can't book that time because it's in the past. Let me check available future dates for you!
+
+DO NOT ignore tool results! DO NOT say "booking confirmed" when you got an ERROR!
 """
             
             response = self.llm_config.generate_response(prompt, system_prompt)
@@ -154,12 +181,23 @@ Remember: If the Observation shows results, include them in your Answer. Don't i
             tool_func = TOOLS[action]
             result = tool_func(**action_input)
             
-            # Format observation with clear structure
+            # Format observation with VERY clear structure for LLM
             if isinstance(result, dict):
                 if result.get("status") == "success":
-                    state["observation"] = f"SUCCESS: {str(result)}"
+                    # For view_bookings, be extra explicit
+                    if action == "view_bookings":
+                        count = result.get("count", 0)
+                        bookings = result.get("bookings", [])
+                        if count > 0:
+                            state["observation"] = f"✅ FOUND {count} BOOKINGS:\n{json.dumps(bookings, indent=2)}\n\nYou MUST list these bookings to the user!"
+                        else:
+                            state["observation"] = f"No bookings found for user {state['current_user']}"
+                    else:
+                        state["observation"] = f"✅ SUCCESS:\n{json.dumps(result, indent=2)}"
+                elif result.get("status") == "error":
+                    state["observation"] = f"❌ ERROR: {result.get('message', 'Unknown error')}"
                 else:
-                    state["observation"] = f"RESULT: {str(result)}"
+                    state["observation"] = f"RESULT:\n{json.dumps(result, indent=2)}"
             else:
                 state["observation"] = str(result)
             
@@ -226,7 +264,7 @@ Remember: If the Observation shows results, include them in your Answer. Don't i
     
     def respond_node(self, state: AgentState) -> AgentState:
         """
-        Response node - generates final answer if not already set.
+        Response node - generates final answer with hallucination detection.
         """
         if not state.get("final_answer"):
             # Generate final response based on conversation
@@ -253,7 +291,44 @@ Start your response with "Answer: "
             else:
                 state["final_answer"] = response.strip()
         
+        # Validate against hallucination
+        final_answer = state["final_answer"]
+        self._validate_no_hallucination(final_answer, state)
+        
         return state
+    
+    def _validate_no_hallucination(self, answer: str, state: AgentState):
+        """
+        Check if the answer contains booking IDs or data not present in observations.
+        Log warnings if potential hallucination detected.
+        """
+        import re
+        
+        # Check for booking ID mentions
+        booking_id_pattern = r'[Bb]ooking\s+ID[:\s]+(\d+)'
+        matches = re.findall(booking_id_pattern, answer)
+        
+        if matches:
+            # Check if this booking ID appeared in recent observations
+            observation = state.get("observation", "")
+            for booking_id in matches:
+                if booking_id not in observation:
+                    logger.warning(
+                        f"⚠️ POTENTIAL HALLUCINATION: Answer mentions Booking ID {booking_id} "
+                        f"but it doesn't appear in observation: {observation[:200]}"
+                    )
+        
+        # Check for confirmation without tool call
+        if any(phrase in answer.lower() for phrase in [
+            "you're all set", "booking confirmed", "booked successfully", 
+            "reservation confirmed", "you are all set"
+        ]):
+            # Verify that book_session was actually called
+            if state.get("action") != "book_session":
+                logger.warning(
+                    f"⚠️ POTENTIAL HALLUCINATION: Answer claims booking success "
+                    f"but last action was '{state.get('action')}', not book_session"
+                )
     
     def should_continue(self, state: AgentState) -> str:
         """
