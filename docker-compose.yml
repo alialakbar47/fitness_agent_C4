@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  fitfusion-app:
+    build: .
+    container_name: fitfusion-assistant
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
